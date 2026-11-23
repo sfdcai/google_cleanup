@@ -1,0 +1,319 @@
+// ==UserScript==
+// @name         Google Photos - delete everything (auto-resuming)
+// @namespace    local
+// @version      2.5
+// @description  Trashes photos in batches of up to 500, reloads the page every few rounds to free memory, resumes automatically, optionally empties the bin at the end.
+// @match        https://photos.google.com/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+// HOW TO USE
+//   1. Tampermonkey -> Create a new script -> paste this file -> Ctrl+S. (Chrome needs Developer mode at chrome://extensions.)
+//      Disable any other Google Photos delete extension/userscript first.
+//   2. Open https://photos.google.com/u/3/ (the main Photos grid).
+//   3. A small panel appears bottom-right. Click START. Leave the tab open and in the foreground.
+//   4. It deletes, reloads itself every few rounds, and carries on until the grid is empty.
+//      If EMPTY_BIN_WHEN_DONE is true it then opens the Bin and empties it (permanent!).
+//   5. Click STOP any time. Remove the script from Tampermonkey when finished.
+
+(() => {
+  // ---------- tunables ----------
+  const BATCH_START         = 500;   // Google's selection cap is ~500
+  const BATCH_MIN           = 50;
+  const ROUNDS_PER_RELOAD   = 3;     // reload the page this often to free memory
+  const PAUSE_AFTER_ROUND   = 1200;  // ms after a successful delete
+  const PAUSE_AFTER_LOAD    = 3000;  // ms to wait for the grid after a reload
+  const DELETE_TIMEOUT      = 60000; // ms to wait for Google to finish moving a batch to the bin
+  const EMPTY_BIN_WHEN_DONE = true;  // after the grid is empty, open the Bin and empty it (PERMANENT)
+  const KEY = 'gpd_state';
+  const VERSION = '2.5';
+
+  // ---------- persistent state ----------
+  const load = () => { try { return JSON.parse(localStorage.getItem(KEY)) || {}; } catch { return {}; } };
+  const save = s => localStorage.setItem(KEY, JSON.stringify(s));
+  let S = Object.assign({ running: false, total: 0, rounds: 0, batch: BATCH_START, failures: 0, dayHeaders: true, emptyLoads: 0, phase: 'grid' }, load());
+  if (S.failures === 0 || S.version !== VERSION) S.batch = BATCH_START;
+  if (S.version !== VERSION) { S.dayHeaders = true; S.phase = 'grid'; S.emptyLoads = 0; }
+  S.version = VERSION; save(S);
+  console.log(`[gpd] script ${VERSION} loaded, batch ${S.batch}, dayHeaders ${S.dayHeaders}, phase ${S.phase}`);
+
+  // ---------- UI panel (DOM calls only: photos.google.com enforces Trusted Types) ----------
+  const el = (tag, css, text) => { const e = document.createElement(tag); if (css) e.style.cssText = css; if (text) e.textContent = text; return e; };
+  const panel = el('div', 'position:fixed;bottom:16px;right:16px;z-index:999999;background:#202124;color:#fff;font:13px system-ui;padding:12px 14px;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.4);min-width:230px');
+  const statusEl = el('div', '', 'idle');
+  const row = el('div', 'margin-top:8px;display:flex;gap:8px');
+  const btnCss = 'padding:6px 12px;border:0;border-radius:6px;color:#202124;cursor:pointer;';
+  const startBtn = el('button', btnCss + 'background:#8ab4f8', 'START');
+  const stopBtn  = el('button', btnCss + 'background:#f28b82', 'STOP');
+  row.append(startBtn, stopBtn);
+  panel.append(el('div', 'font-weight:600;margin-bottom:6px', `Photos bulk delete v${VERSION}`), statusEl, row);
+  document.body.appendChild(panel);
+  const status = msg => { statusEl.textContent = msg; console.log('[gpd]', msg); };
+  startBtn.onclick = () => { S.running = true; S.failures = 0; S.emptyLoads = 0; S.phase = 'grid'; save(S); location.reload(); };
+  stopBtn.onclick  = () => { S.running = false; save(S); status(`stopped - ${S.total} trashed`); };
+
+  // ---------- helpers ----------
+  const WAIT = ms => new Promise(r => setTimeout(r, ms));
+  const visible = e => {
+    if (!e || !e.isConnected) return false;
+    const r = e.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    if (r.right <= 0 || r.bottom <= 0 || r.left >= innerWidth || r.top >= innerHeight) return false; // parked off-screen
+    const cs = getComputedStyle(e);
+    return cs.visibility !== 'hidden' && cs.display !== 'none';
+  };
+  // aria-label is the reliable name on this site; fall back to title / text
+  const label = e => (e.getAttribute('aria-label') || e.getAttribute('title') || e.textContent || '').replace(/\s+/g, ' ').trim();
+  const dialogs = () => [...document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"]')].filter(visible);
+  const inDialog = e => !!e.closest('[role="dialog"], [role="alertdialog"], [aria-modal="true"]');
+  const buttons = (scope = document) => [...scope.querySelectorAll('button, [role="button"], [role="menuitem"]')].filter(visible).filter(b => !panel.contains(b));
+  const enabled = b => b && !b.disabled && b.getAttribute('aria-disabled') !== 'true';
+  // never click anything that could spend money
+  const NEVER = /get \d+\s*[gt]b|upgrade|buy|subscribe|per month|\/month|learn more|cancel/i;
+  const findBtn = (re, scope = document, exclude = NEVER) => buttons(scope).find(b => re.test(label(b)) && !exclude.test(label(b)));
+  // exact labels of the destructive confirm button (UK + US English)
+  const CONFIRM_RE = /^(move to bin|move to trash|delete|remove|delete permanently|empty bin|empty trash)$/i;
+  const isConfirmDialog = d => !!findBtn(CONFIRM_RE, d, /^$/);
+  const confirmDialog = () => dialogs().find(isConfirmDialog) || null;
+
+  const tileBoxes = () => {
+    const t = [...document.querySelectorAll('[role="checkbox"].ckGgle')];
+    return (t.length ? t : [...document.querySelectorAll('[role="checkbox"]')].filter(b => !/select all/i.test(label(b)))).filter(b => !inDialog(b) && enabled(b));
+  };
+  const dayBoxes = () => [...document.querySelectorAll('[role="checkbox"]')].filter(b => /select all/i.test(label(b)) && !inDialog(b) && enabled(b));
+  const isChecked = b => b.getAttribute('aria-checked') === 'true' || b.checked === true;
+  // Google's own "N selected" counter (cheap); fall back to counting rendered checked tiles
+  const counterEl = () => document.querySelector('.rtExYb');
+  const toolbarCount = () => {
+    const c = counterEl();
+    const m = c && (c.textContent || '').match(/\d[\d,]*/);
+    return m ? parseInt(m[0].replace(/,/g, ''), 10) : 0;
+  };
+  const selectedTotal = () => Math.max(toolbarCount(), tileBoxes().filter(isChecked).length);
+  // click the way a pointer does - the tile handlers listen on mousedown + click
+  const pointerClick = e => {
+    const r = e.getBoundingClientRect();
+    const init = { bubbles: true, cancelable: true, composed: true, button: 0, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+    for (const t of ['pointerdown', 'mousedown', 'pointerup', 'mouseup']) e.dispatchEvent(new (t.startsWith('pointer') ? PointerEvent : MouseEvent)(t, init));
+    e.click();
+  };
+  const pressKey = (key, code, extra = {}) => {
+    for (const type of ['keydown', 'keypress', 'keyup']) {
+      const ev = new KeyboardEvent(type, { key, code, bubbles: true, cancelable: true, ...extra });
+      (document.activeElement || document.body).dispatchEvent(ev); document.body.dispatchEvent(ev); document.dispatchEvent(ev);
+    }
+  };
+  const waitFor = async (fn, ms, step = 150) => { const end = Date.now() + ms; while (Date.now() < end) { const v = fn(); if (v) return v; await WAIT(step); } return null; };
+
+  // Dismiss anything that is not the delete confirmation (Google One upsell: "Keep deleting", "Not now", ...).
+  // Never clicks Get N GB / Upgrade / Buy / Subscribe.
+  const dismissPopups = async () => {
+    for (let i = 0; i < 4; i++) {
+      let clicked = false;
+      for (const d of dialogs()) {
+        if (isConfirmDialog(d)) continue;
+        const btn = findBtn(/^(keep deleting|continue|not now|no,? thanks|dismiss|close|skip|got it|ok|okay|done|maybe later|later)$/i, d)
+                 || findBtn(/keep deleting|not now|no,? thanks|dismiss|got it|maybe later/i, d);
+        if (btn) { console.log('[gpd] dismissing popup via:', label(btn)); btn.click(); clicked = true; await WAIT(600); }
+      }
+      if (!clicked) break;
+    }
+  };
+  const clearSelection = async () => {
+    const x = findBtn(/^(clear selection|deselect all|cancel selection)$/i, document, /^$/);
+    if (x && !inDialog(x)) x.click(); else pressKey('Escape', 'Escape');
+    await WAIT(600);
+  };
+
+  // The photo grid scrolls inside its own container (C-WIZ.yDSiEe.uGCjIb.zcLWac), not the window
+  const scroller = () => {
+    const known = document.querySelector('.yDSiEe.uGCjIb.zcLWac');
+    if (known && known.scrollHeight > known.clientHeight + 50) return known;
+    let e = tileBoxes()[0] || dayBoxes()[0];
+    while (e && e !== document.body) {
+      const cs = getComputedStyle(e);
+      if (/(auto|scroll)/.test(cs.overflowY) && e.scrollHeight > e.clientHeight + 50) return e;
+      e = e.parentElement;
+    }
+    return document.scrollingElement || document.documentElement;
+  };
+  const scrollGrid = dy => { const s = scroller(); s.scrollTop += dy; s.dispatchEvent(new Event('scroll', { bubbles: true })); };
+  const scrollGridTop = () => { const s = scroller(); s.scrollTop = 0; window.scrollTo(0, 0); };
+
+  // Scroll-and-sweep. Day-header checkboxes select a whole day in one click (fast); individual tiles fill the rest.
+  // Stops at the batch size, at Google's selection cap (counter stops growing although we clicked), or at the end of the library.
+  const selectBatch = async () => {
+    scrollGridTop(); await WAIT(400);
+    let last = 0, stall = 0, capHits = 0, clicks = 0, usedDay = false;
+    for (let step = 0; step < 200; step++) {
+      let c = selectedTotal();
+      let stepClicks = 0;
+      if (S.dayHeaders) {
+        for (const b of dayBoxes().filter(b => !isChecked(b))) {
+          if (selectedTotal() >= S.batch) break;
+          pointerClick(b); clicks++; stepClicks++; usedDay = true; await WAIT(150);
+        }
+      }
+      for (let wave = 0; wave < 6; wave++) {
+        const un = tileBoxes().filter(b => !isChecked(b));
+        if (!un.length || selectedTotal() >= S.batch) break;
+        for (const b of un.slice(0, Math.max(1, S.batch - selectedTotal()))) { pointerClick(b); clicks++; stepClicks++; }
+        await WAIT(60);
+      }
+      await WAIT(120);
+      c = selectedTotal();
+      if (c >= S.batch) break;
+      if (stepClicks > 0 && c === last && c > 0) { if (++capHits >= 2) { console.log(`[gpd] selection cap reached at ${c}`); break; } } else capHits = 0;
+      if (stepClicks === 0 && c === last) { if (++stall >= 6) break; } else stall = 0;   // end of library
+      last = c;
+      scrollGrid(innerHeight * 0.9);
+      await waitFor(() => tileBoxes().some(b => !isChecked(b)) || dayBoxes().some(b => !isChecked(b)), 1500, 100);
+    }
+    scrollGridTop();
+    await WAIT(800);   // let Google finish registering the selection before we hit the toolbar
+    const n = selectedTotal();
+    console.log(`[gpd] sweep: ${clicks} clicks, toolbar says ${n} selected${usedDay ? ' (day headers used)' : ''}`);
+    return { n, usedDay };
+  };
+
+  const toolbarDeleteBtn = () => {
+    const direct = document.querySelector('button[aria-label="Move to bin"], button[aria-label="Move to trash"], button[aria-label="Delete"]');
+    if (direct && visible(direct) && !inDialog(direct)) return direct;
+    const b = findBtn(/^(move to bin|move to trash|delete)$/i, document, /^$/);
+    return b && !inDialog(b) ? b : null;
+  };
+
+  const openDeleteDialog = async () => {
+    for (let attempt = 0; attempt < 12; attempt++) {
+      const btn = toolbarDeleteBtn();
+      if (btn && enabled(btn)) {
+        console.log(`[gpd] clicking toolbar button: ${label(btn)} (attempt ${attempt + 1})`);
+        btn.focus(); pointerClick(btn);
+        if (await waitFor(confirmDialog, 2500)) return true;
+      } else {
+        await WAIT(500);
+      }
+    }
+    pressKey('#', 'Digit3', { shiftKey: true });                      // keyboard shortcut for "move to bin"
+    if (await waitFor(confirmDialog, 3000)) return true;
+    const more = findBtn(/^more options$/i, document, /^$/);           // overflow menu fallback
+    if (more && !inDialog(more)) {
+      more.click(); await WAIT(600);
+      const menu = document.querySelector('[role="menu"]');
+      const item = menu && findBtn(/^(move to bin|move to trash|delete)$/i, menu, /^$/);
+      if (item) item.click(); else pressKey('Escape', 'Escape');
+    }
+    const ok = !!(await waitFor(confirmDialog, 3000));
+    if (!ok) console.warn('[gpd] dialogs present:', [...document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"]')].map(d => ({ visible: visible(d), buttons: buttons(d).map(label) })));
+    return ok;
+  };
+
+  const confirmDelete = async () => {
+    const dlg = confirmDialog(); if (!dlg) return false;
+    for (const cb of dlg.querySelectorAll('[role="checkbox"], input[type="checkbox"]')) if (!isChecked(cb)) { cb.click(); await WAIT(150); }
+    const btn = findBtn(CONFIRM_RE, dlg, /^$/);
+    if (!btn) { console.warn('[gpd] no exact confirm button in dialog; buttons:', buttons(dlg).map(label)); return false; }
+    console.log('[gpd] confirming with:', label(btn));
+    btn.click(); return true;
+  };
+
+  // ---------- empty the bin (PERMANENT) ----------
+  const base = () => (location.pathname.match(/^\/u\/\d+/) || [''])[0];
+  const emptyBin = async () => {
+    status('emptying the bin...'); await WAIT(PAUSE_AFTER_LOAD);
+    await dismissPopups();
+    const btn = await waitFor(() => findBtn(/^(empty bin|empty trash)$/i, document, /^$/), 15000, 300);
+    if (!btn) {
+      const txt = document.body.innerText || '';
+      if (/bin is empty|trash is empty|nothing in (the )?bin|nothing in (the )?trash/i.test(txt)) { S.running = false; S.phase = 'finished'; save(S); status(`ALL DONE - ${S.total} items deleted, bin is empty.`); return; }
+      S.failures++; save(S);
+      if (S.failures >= 3) { S.running = false; save(S); status('stopped: could not find the Empty bin button - empty it by hand'); return; }
+      location.reload(); return;
+    }
+    console.log('[gpd] clicking:', label(btn)); btn.click();
+    const dlg = await waitFor(confirmDialog, 5000);
+    if (dlg) {
+      for (const cb of dlg.querySelectorAll('[role="checkbox"], input[type="checkbox"]')) if (!isChecked(cb)) { cb.click(); await WAIT(150); }
+      const ok = findBtn(CONFIRM_RE, dlg, /^$/);
+      if (ok) { console.log('[gpd] confirming with:', label(ok)); ok.click(); }
+    }
+    await waitFor(() => dialogs().length === 0, 30000, 300);
+    await WAIT(3000);
+    S.running = false; S.phase = 'finished'; save(S);
+    status(`ALL DONE - ${S.total} items deleted and bin emptied.`);
+  };
+
+  // ---------- main ----------
+  const run = async () => {
+    if (!S.running) { status(`idle - ${S.total} trashed so far`); return; }
+    if (S.phase === 'bin') {
+      if (/\/trash\/?$/.test(location.pathname)) return emptyBin();
+      location.href = `https://photos.google.com${base()}/trash`; return;
+    }
+    if (!/^\/(u\/\d+\/?)?$/.test(location.pathname)) { status('open the main Photos grid to run'); return; }
+    status('waiting for grid...'); await WAIT(PAUSE_AFTER_LOAD);
+    let roundsThisLoad = 0, emptyScans = 0;
+
+    while (S.running) {
+      await dismissPopups();
+      const { n, usedDay } = await selectBatch();
+      if (!n) {
+        for (let i = 0; i < 4 && !tileBoxes().length && !dayBoxes().length; i++) { scrollGrid(innerHeight); window.scrollBy(0, innerHeight); await WAIT(800); }
+        if (++emptyScans > 2) {
+          // confirm emptiness on a fresh page load before declaring victory
+          if (S.emptyLoads < 2) { S.emptyLoads++; save(S); status('grid looks empty - reloading to double-check'); await WAIT(800); location.reload(); return; }
+          if (EMPTY_BIN_WHEN_DONE) { S.phase = 'bin'; S.failures = 0; save(S); status(`grid empty - ${S.total} trashed. Opening the bin...`); await WAIT(800); location.href = `https://photos.google.com${base()}/trash`; return; }
+          S.running = false; save(S);
+          status(`DONE - ${S.total} items trashed. Now open Bin -> Empty bin.`); return;
+        }
+        continue;
+      }
+      emptyScans = 0; S.emptyLoads = 0;
+      status(`round ${S.rounds + 1}: ${n} selected, deleting...`);
+
+      if (!(await openDeleteDialog())) {
+        console.warn('[gpd] delete dialog not found; toolbar buttons:', buttons().filter(b => !inDialog(b)).map(label));
+        await clearSelection();
+        if (usedDay && S.dayHeaders) {
+          // whole-day selections sometimes leave the toolbar unresponsive: fall back to tile-by-tile like the extension does
+          S.dayHeaders = false; S.failures = 0; save(S);
+          status('switching to tile-only selection and retrying'); await WAIT(800); location.reload(); return;
+        }
+        S.failures++; save(S);
+        if (S.failures >= 3) { S.running = false; save(S); status('stopped: cannot open delete dialog (see console)'); return; }
+        location.reload(); return;
+      }
+      if (!(await confirmDelete())) {
+        S.failures++; save(S);
+        if (S.failures >= 3) { S.running = false; save(S); status('stopped: cannot confirm (see console)'); return; }
+        location.reload(); return;
+      }
+
+      // wait for Google to finish: counter back to 0 and no confirmation dialog; dismiss upsells meanwhile
+      const t0 = Date.now(); let gone = false;
+      while (Date.now() - t0 < DELETE_TIMEOUT) {
+        await dismissPopups();
+        if (toolbarCount() === 0 && !confirmDialog()) { gone = true; break; }
+        await WAIT(300);
+      }
+      if (gone) {
+        S.total += n; S.rounds++; S.failures = 0; roundsThisLoad++;
+        if (S.batch < BATCH_START) S.batch = Math.min(BATCH_START, S.batch * 2);
+        save(S); status(`round ${S.rounds} ok - total ${S.total} trashed`);
+        await waitFor(() => !tileBoxes().some(isChecked), 5000, 200);   // trashed tiles leave the grid
+      } else {
+        S.failures++; S.batch = Math.max(BATCH_MIN, Math.floor(S.batch / 2)); save(S);
+        status(`refused - retrying with batch ${S.batch}`);
+        if (S.failures >= 6) { S.running = false; save(S); status('stopped after repeated refusals'); return; }
+        location.reload(); return;
+      }
+
+      await WAIT(PAUSE_AFTER_ROUND);
+      await dismissPopups();
+      if (roundsThisLoad >= ROUNDS_PER_RELOAD) { status('reloading to free memory...'); await WAIT(800); location.reload(); return; }
+    }
+  };
+
+  run();
+})();
