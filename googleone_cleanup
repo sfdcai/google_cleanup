@@ -1,0 +1,95 @@
+// Google One storage manager - select all + delete, repeated until the list is empty.
+// Run in the console on one.google.com/storage/management/... (Drive "Large files" or Photos "Large photos & videos").
+// Some views delete PERMANENTLY, others move to trash - read the dialog once before you leave it running.
+// Stop any time with:  window.STOP_DELETE = true
+
+(async () => {
+  const WAIT = ms => new Promise(r => setTimeout(r, ms));
+  window.STOP_DELETE = false;
+
+  const visible = el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const label = el => (el.getAttribute('aria-label') || el.textContent || '').replace(/\s+/g, ' ').trim();
+  const NEVER = /get \d+\s*[gt]b|more storage|upgrade|buy|subscribe|per month|\/month|learn more|clean up gmail|cancel/i;
+  const btns = (scope = document) => [...scope.querySelectorAll('button, [role="button"]')].filter(visible);
+  const findBtn = (re, scope = document) => btns(scope).find(b => re.test(label(b)) && !NEVER.test(label(b)));
+  const checkboxes = (scope = document) => [...scope.querySelectorAll('[role="checkbox"], input[type="checkbox"]')].filter(visible);
+  const isChecked = b => b.getAttribute('aria-checked') === 'true' || b.checked === true;
+  const dialogs = () => [...document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"]')].filter(visible);
+
+  // exact labels of the destructive confirm button
+  const CONFIRM_RE = /^(move to trash|move to bin|delete|delete permanently|permanently delete|remove|confirm|delete \d[\d,]* items?)$/i;
+  const confirmDialog = () => dialogs().find(d => findBtn(CONFIRM_RE, d)) || null;
+
+  // Dismiss the "Keep deleting / Get more storage" upsell (never clicks the upgrade button).
+  // The interstitial is not always a role="dialog" and "Keep deleting" may be a link, so search the whole page
+  // for the text and climb to the nearest clickable ancestor.
+  // Only the popup's own button ("Close dialog") or an explicit dismiss label - NOT a bare "Close",
+  // which is also the X on the selection toolbar and would clear the selection.
+  const DISMISS_RE = /^(close dialog|keep deleting|continue deleting|not now|no,? thanks|dismiss|got it|maybe later)$/i;
+  const findDismiss = () => {
+    const cd = confirmDialog();
+    return [...document.querySelectorAll('button, a, [role="button"], [role="link"]')].filter(visible)
+      .find(e => DISMISS_RE.test(label(e)) && !NEVER.test(label(e)) && !(cd && cd.contains(e)));
+  };
+  const dismissPopups = async () => {
+    let lastBtn = null;
+    for (let i = 0; i < 20; i++) {
+      const btn = findDismiss();
+      if (!btn) break;
+      if (btn === lastBtn) { console.warn('dismiss button did not go away, giving up on it:', label(btn)); break; }
+      console.log('dismissing popup via:', label(btn));
+      btn.click(); lastBtn = btn;
+      await WAIT(700);
+    }
+    if (/keep deleting/i.test(document.body.innerText || '')) {
+      console.warn('upsell text still on page; clickable elements near it:',
+        [...document.querySelectorAll('button, a, [role="button"], [role="link"]')].filter(visible).map(label));
+    }
+  };
+
+  let rounds = 0, idle = 0, total = 0;
+
+  while (!window.STOP_DELETE) {
+    await WAIT(1500);
+    await dismissPopups();
+
+    // 1. Select everything on the page: prefer the header "select all" box, else tick each row
+    const boxes = checkboxes().filter(b => !b.closest('[role="dialog"], [role="alertdialog"]'));
+    const selectAll = boxes.find(b => /select all|all items|all files/i.test(label(b)));
+    const rows = boxes.filter(b => b !== selectAll);
+
+    if (!rows.length) {
+      if (++idle > 4) { console.log('No more items found - done.'); break; }
+      window.scrollBy(0, 600); continue;
+    }
+    idle = 0;
+
+    if (selectAll && !isChecked(selectAll)) selectAll.click();
+    else if (!selectAll) for (const b of rows) if (!isChecked(b)) { b.click(); await WAIT(80); }
+    await WAIT(800);
+
+    // 2. Click Delete in the toolbar
+    const del = findBtn(/^(delete|move to trash|move to bin|remove)$/i) || findBtn(/^\s*delete\b|move to trash|move to bin/i);
+    if (!del) { console.warn('Delete button not found - stopping. Visible buttons:', btns().map(label)); return; }
+    del.click();
+
+    // 3. Confirmation dialog: tick any "I understand" box, then click the exact confirm button
+    let dlg = null;
+    for (let i = 0; i < 20 && !(dlg = confirmDialog()); i++) await WAIT(250);
+    if (!dlg) { console.warn('Confirm dialog not found - stopping. Dialogs:', dialogs().map(d => btns(d).map(label))); return; }
+    for (const b of checkboxes(dlg)) if (!isChecked(b)) { b.click(); await WAIT(300); }
+    const confirm = findBtn(CONFIRM_RE, dlg);
+    if (!confirm) { console.warn('Confirm button not found - stopping. Dialog buttons:', btns(dlg).map(label)); return; }
+    console.log('confirming with:', label(confirm));
+    confirm.click();
+
+    total += rows.length;
+    console.log(`Round ${++rounds}: ${rows.length} items (total ${total}). Waiting for the list to refresh...`);
+    for (let i = 0; i < 20; i++) { await WAIT(500); await dismissPopups(); if (!dialogs().length) break; }
+    await WAIT(2500);
+    await dismissPopups();
+    window.scrollTo(0, 0);
+  }
+
+  console.log(window.STOP_DELETE ? 'Stopped by user.' : `Finished after ${rounds} rounds, ${total} items.`);
+})();
